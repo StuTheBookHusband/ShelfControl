@@ -207,7 +207,7 @@ body{font-family:'Lato',sans-serif;background:var(--plum);color:var(--text-prima
 .scan-status{display:none;margin:10px auto 0;color:#fff;font-size:12px;font-weight:700;background:rgba(0,0,0,.6);border:1px solid rgba(255,255,255,.2);border-radius:12px;padding:8px 12px;line-height:1.4}
 .scan-status.show{display:block}
 .scan-controls{position:absolute;left:0;right:0;bottom:calc(var(--safe-b) + 32px);display:flex;justify-content:center;gap:12px;z-index:2}
-.scan-ctl{background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.3);color:#fff;border-radius:24px;padding:12px 18px;font-size:14px;font-weight:700;font-family:'Lato',sans-serif;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);cursor:pointer}
+.scan-ctl{background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.3);color:#fff;border-radius:24px;padding:12px 14px;font-size:14px;font-weight:700;font-family:'Lato',sans-serif;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);cursor:pointer}
 .scan-ctl.on{background:var(--gold);border-color:var(--gold);color:var(--plum)}
 .scan-ctl.unsupported{opacity:.6}
 .scan-close{position:absolute;top:calc(var(--safe-t)+14px);right:18px;background:rgba(255,255,255,.2);border:none;color:#fff;width:44px;height:44px;border-radius:50%;font-size:20px;cursor:pointer;display:flex;align-items:center;justify-content:center;pointer-events:all;z-index:2}
@@ -457,9 +457,11 @@ body{font-family:'Lato',sans-serif;background:var(--plum);color:var(--text-prima
   <button class="scan-close" onclick="closeScanner()">✕</button>
   <div class="scan-controls">
     <button class="scan-ctl" id="scan-torch" onclick="toggleTorch()">🔦 Flash</button>
-    <button class="scan-ctl" onclick="scanTypeISBN()">⌨️ Type ISBN</button>
+    <button class="scan-ctl" onclick="scanTakePhoto()">📸 Photo</button>
+    <button class="scan-ctl" onclick="scanTypeISBN()">⌨️ ISBN</button>
   </div>
 </div>
+<input type="file" id="scan-photo" accept="image/*" capture="environment" style="display:none" onchange="handlePhotoScan(event)">
 
 <!-- ===== SHELF DETAIL (full screen) ===== -->
 <div class="modal-full" id="modal-shelf-detail">
@@ -497,6 +499,7 @@ body{font-family:'Lato',sans-serif;background:var(--plum);color:var(--text-prima
     <div class="lookup-banner" id="lookup-banner"></div>
     <div style="display:flex;gap:7px;margin-bottom:10px">
       <button class="btn btn-secondary" style="flex:1;font-size:11px;padding:9px 6px" onclick="openScanner()">📷 Scan</button>
+      <button class="btn btn-secondary" style="flex:1;font-size:11px;padding:9px 6px" onclick="startPhotoScan('book')">📸 Photo</button>
       <button class="btn btn-secondary" style="flex:1;font-size:11px;padding:9px 6px" onclick="showLookupPanel('isbn')">🔢 ISBN</button>
       <button class="btn btn-secondary" style="flex:1;font-size:11px;padding:9px 6px" onclick="showLookupPanel('search')">🔍 Search</button>
     </div>
@@ -880,6 +883,14 @@ async function loadZXing(){
   return false;
 }
 
+function initZXing(){
+  if(zxReader)return;
+  zxReader=new ZXing.MultiFormatReader();
+  zxHints=new Map();
+  zxHints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS,[ZXing.BarcodeFormat.EAN_13]);
+  zxHints.set(ZXing.DecodeHintType.TRY_HARDER,true);
+}
+
 async function openScanner(mode='book'){
   scanMode=mode;
   if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){handleNoCameraAvailable(mode,null);return;}
@@ -898,7 +909,7 @@ async function openScanner(mode='book'){
   document.getElementById('scanner-wrap').classList.add('open');
   showScanStatus('Starting camera…');
   try{
-    const stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}}});
+    const stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:3840},height:{ideal:2160}}});
     scanStream=stream;
     scanTrack=stream.getVideoTracks()[0];
     const v=document.getElementById('scan-video');
@@ -937,11 +948,9 @@ async function startDetector(){
     const ok=await loadZXing();
     if(!scanStream)return; // closed while loading
     if(!ok){showScanStatus('Scanner could not load — check your connection, or tap Type ISBN.');return;}
-    zxReader=new ZXing.MultiFormatReader();
-    zxHints=new Map();
-    zxHints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS,[ZXing.BarcodeFormat.EAN_13]);
-    zxHints.set(ZXing.DecodeHintType.TRY_HARDER,true);
+    initZXing();
   }
+  scanTipAt=Date.now();scanTipIdx=0;
   scanActive=true;
   showScanStatus('Looking for a barcode…');
   scheduleScan(150);
@@ -951,21 +960,56 @@ function scheduleScan(delay){
   if(!scanActive)return;
   scanTimer=setTimeout(scanTick,delay);
 }
-function decodeFrameZXing(v){
-  const c=document.getElementById('scan-canvas');
-  const vw=v.videoWidth,vh=v.videoHeight;
-  const sw=Math.round(vw*0.92);
-  const sh=Math.round(vh*(vw<vh?0.4:0.6));
-  const sx=Math.round((vw-sw)/2),sy=Math.round((vh-sh)/2);
-  const scale=Math.min(1,960/sw);
-  c.width=Math.round(sw*scale);c.height=Math.round(sh*scale);
-  const ctx=c.getContext('2d',{willReadFrequently:true});
-  ctx.drawImage(v,sx,sy,sw,sh,0,0,c.width,c.height);
+function decodeCanvasZXing(cv){
   try{
-    const src=new ZXing.HTMLCanvasElementLuminanceSource(c);
+    const src=new ZXing.HTMLCanvasElementLuminanceSource(cv);
     const bmp=new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(src));
     return zxReader.decode(bmp,zxHints).getText();
   }catch(e){return null;} // NotFound / checksum errors are normal between frames
+}
+function stretchContrast(cv){
+  const ctx=cv.getContext('2d',{willReadFrequently:true});
+  const d=ctx.getImageData(0,0,cv.width,cv.height);const a=d.data;
+  const hist=new Uint32Array(256);
+  for(let i=0;i<a.length;i+=4){const y=(a[i]*77+a[i+1]*150+a[i+2]*29)>>8;a[i]=a[i+1]=a[i+2]=y;hist[y]++;}
+  const total=cv.width*cv.height;let lo=0,hi=255,acc=0;
+  for(let i=0;i<256;i++){acc+=hist[i];if(acc>total*0.02){lo=i;break;}}
+  acc=0;for(let i=255;i>=0;i--){acc+=hist[i];if(acc>total*0.02){hi=i;break;}}
+  if(hi-lo>=20){
+    const k=255/(hi-lo);
+    for(let i=0;i<a.length;i+=4){let v=(a[i]-lo)*k;v=v<0?0:v>255?255:v;a[i]=a[i+1]=a[i+2]=v;}
+  }
+  ctx.putImageData(d,0,0);
+}
+// Alternates between a wide band and a tighter, contrast-boosted, upscaled band
+let scanPass=0;
+function decodeFrameZXing(v,pass){
+  const cv=document.getElementById('scan-canvas');
+  const vw=v.videoWidth,vh=v.videoHeight;
+  const portrait=vw<vh;
+  const tight=pass%2===1;
+  const sw=Math.round(vw*(tight?0.7:0.92));
+  const sh=Math.round(vh*(portrait?(tight?0.2:0.4):(tight?0.35:0.6)));
+  const sx=Math.round((vw-sw)/2),sy=Math.round((vh-sh)/2);
+  const scale=Math.min(tight?2:1,1600/sw);
+  cv.width=Math.round(sw*scale);cv.height=Math.round(sh*scale);
+  const ctx=cv.getContext('2d',{willReadFrequently:true});
+  ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality='high';
+  ctx.drawImage(v,sx,sy,sw,sh,0,0,cv.width,cv.height);
+  if(tight)stretchContrast(cv);
+  return decodeCanvasZXing(cv);
+}
+const SCAN_TIPS=[
+  'Hold the phone about 6–8 inches away until the bars look sharp.',
+  'Need light? Move near a lamp and tilt the book to avoid glare.',
+  'Still not reading? Tap 📸 Photo — it uses your camera\'s full focus.'
+];
+let scanTipAt=0,scanTipIdx=0;
+function maybeShowScanTip(){
+  if(Date.now()-scanTipAt<8000)return;
+  scanTipAt=Date.now();
+  showScanStatus(SCAN_TIPS[scanTipIdx%SCAN_TIPS.length],6000);
+  scanTipIdx++;
 }
 async function scanTick(){
   if(!scanActive||!scanStream)return;
@@ -974,16 +1018,16 @@ async function scanTick(){
   let code=null;
   try{
     if(nativeDetector){const bs=await nativeDetector.detect(v);if(bs.length)code=bs[0].rawValue;}
-    else code=decodeFrameZXing(v);
+    else code=decodeFrameZXing(v,scanPass++);
   }catch(e){}
-  if(code)await onBarcode(code);
-  scheduleScan(nativeDetector?250:220);
+  if(code)await onBarcode(code);else maybeShowScanTip();
+  scheduleScan(nativeDetector?250:200);
 }
 async function onBarcode(raw){
   const code=String(raw).replace(/[^0-9Xx]/g,'');
   const now=Date.now();
   if(code===lastScan.code&&now-lastScan.t<4000)return; // same barcode still in view
-  lastScan={code,t:now};
+  lastScan={code,t:now};scanTipAt=now;
   const isbn=normalizeISBN(code);
   if(!isbn){showScanStatus(`Read ${code} — not a book ISBN. Aim at the barcode starting with 978 or 979.`,3500);return;}
   if(navigator.vibrate)navigator.vibrate(60);
@@ -1012,6 +1056,61 @@ function scanTypeISBN(){
   const isbn=normalizeISBN(raw);
   if(!isbn){showToast("That doesn't look like a valid ISBN");return;}
   handleScannedISBN(isbn);
+}
+
+// ---- Photo scan: uses the phone's own camera app (proper focus, full resolution) ----
+let photoMode='book';
+function startPhotoScan(mode){photoMode=mode;document.getElementById('scan-photo').click();}
+function scanTakePhoto(){
+  const mode=scanMode;
+  closeScanner();
+  if(mode==='book')openAddBook();
+  startPhotoScan(mode);
+}
+async function decodePhotoFile(file){
+  if(!(await loadZXing()))throw new Error('decoder not loaded');
+  initZXing();
+  const url=URL.createObjectURL(file);
+  try{
+    const img=await new Promise((res,rej)=>{const i=new Image();i.onload=()=>res(i);i.onerror=rej;i.src=url;});
+    const W=img.naturalWidth,H=img.naturalHeight;
+    const cv=document.getElementById('scan-canvas');
+    const ctx=cv.getContext('2d',{willReadFrequently:true});
+    ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality='high';
+    const crops=[[0,0,1,1],[0.08,0.2,0.84,0.6],[0.15,0.35,0.7,0.3]];
+    for(const md of [1800,1200,2600]){
+      for(const [cx,cy,cw,ch] of crops){
+        const sx=W*cx,sy=H*cy,sw=W*cw,sh=H*ch;
+        const scale=Math.min(md/Math.max(sw,sh),3);
+        const tw=Math.round(sw*scale),th=Math.round(sh*scale);
+        for(const rot of [0,1]){
+          if(rot===0){cv.width=tw;cv.height=th;ctx.drawImage(img,sx,sy,sw,sh,0,0,tw,th);}
+          else{cv.width=th;cv.height=tw;ctx.save();ctx.translate(th,0);ctx.rotate(Math.PI/2);ctx.drawImage(img,sx,sy,sw,sh,0,0,tw,th);ctx.restore();}
+          let txt=decodeCanvasZXing(cv);
+          let isbn=txt&&normalizeISBN(txt);
+          if(!isbn){stretchContrast(cv);txt=decodeCanvasZXing(cv);isbn=txt&&normalizeISBN(txt);}
+          if(isbn)return isbn;
+          await new Promise(r=>setTimeout(r,0)); // keep the UI responsive
+        }
+      }
+    }
+    return null;
+  }finally{URL.revokeObjectURL(url);}
+}
+async function handlePhotoScan(e){
+  const file=e.target.files&&e.target.files[0];
+  e.target.value='';
+  if(!file)return;
+  showToast('📸 Reading barcode from photo…');
+  let isbn=null;
+  try{isbn=await decodePhotoFile(file);}catch(err){console.error(err);}
+  if(!isbn){showToast('Could not read a barcode — get closer, keep it flat, or use ISBN');return;}
+  if(navigator.vibrate)navigator.vibrate(60);
+  if(photoMode==='book'){await fetchISBN(isbn,true);}
+  else{
+    const book=await fetchISBNSilent(isbn,photoMode);
+    if(book){showToast(`✅ Added: ${book.title}`);renderShelfDetailBooks();renderShelves();}
+  }
 }
 
 // ---- Flash / torch ----
