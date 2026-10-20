@@ -199,10 +199,17 @@ body{font-family:'Lato',sans-serif;background:var(--plum);color:var(--text-prima
   /* No max-width — video must fill the full viewport so the overlay aligns */
 }
 .scan-overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;pointer-events:none;z-index:1}
-.scan-frame{width:260px;height:160px;border:2px solid var(--rose);border-radius:12px;box-shadow:0 0 0 9999px rgba(0,0,0,.55);position:relative}
+.scan-frame{width:min(88vw,340px);height:150px;border:2px solid var(--rose);border-radius:12px;box-shadow:0 0 0 9999px rgba(0,0,0,.55);position:relative}
 .scan-line{position:absolute;left:0;right:0;height:2px;background:var(--rose);animation:scanLine 2s ease-in-out infinite;top:50%}
 @keyframes scanLine{0%,100%{top:8%}50%{top:90%}}
-.scan-label{margin-top:26px;color:#fff;font-size:13px;font-weight:700;text-align:center;padding:0 20px}
+.scan-label{color:#fff;font-size:13px;font-weight:700;text-align:center;text-shadow:0 1px 4px rgba(0,0,0,.8)}
+.scan-below{position:absolute;top:calc(100% + 16px);left:50%;transform:translateX(-50%);width:92vw;max-width:360px;text-align:center}
+.scan-status{display:none;margin:10px auto 0;color:#fff;font-size:12px;font-weight:700;background:rgba(0,0,0,.6);border:1px solid rgba(255,255,255,.2);border-radius:12px;padding:8px 12px;line-height:1.4}
+.scan-status.show{display:block}
+.scan-controls{position:absolute;left:0;right:0;bottom:calc(var(--safe-b) + 32px);display:flex;justify-content:center;gap:12px;z-index:2}
+.scan-ctl{background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.3);color:#fff;border-radius:24px;padding:12px 18px;font-size:14px;font-weight:700;font-family:'Lato',sans-serif;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);cursor:pointer}
+.scan-ctl.on{background:var(--gold);border-color:var(--gold);color:var(--plum)}
+.scan-ctl.unsupported{opacity:.6}
 .scan-close{position:absolute;top:calc(var(--safe-t)+14px);right:18px;background:rgba(255,255,255,.2);border:none;color:#fff;width:44px;height:44px;border-radius:50%;font-size:20px;cursor:pointer;display:flex;align-items:center;justify-content:center;pointer-events:all;z-index:2}
 .scan-shelf-banner{position:absolute;top:calc(var(--safe-t)+68px);left:50%;transform:translateX(-50%);background:rgba(196,120,138,.92);border-radius:20px;padding:6px 18px;font-size:12px;font-weight:700;color:#fff;white-space:nowrap;pointer-events:none;z-index:2}
 /* Edition picker */
@@ -436,12 +443,22 @@ body{font-family:'Lato',sans-serif;background:var(--plum);color:var(--text-prima
 <!-- ===== SCANNER ===== -->
 <div id="scanner-wrap">
   <video id="scan-video" autoplay playsinline muted></video>
+  <canvas id="scan-canvas" style="display:none"></canvas>
   <div class="scan-overlay">
-    <div id="scan-shelf-banner" class="scan-shelf-banner hidden"></div>
-    <div class="scan-frame"><div class="scan-line"></div></div>
-    <div class="scan-label" id="scan-label">Point at the barcode on the back of the book</div>
+    <div class="scan-frame">
+      <div class="scan-line"></div>
+      <div class="scan-below">
+        <div class="scan-label" id="scan-label">Point at the barcode on the back of the book</div>
+        <div class="scan-status" id="scan-status"></div>
+      </div>
+    </div>
   </div>
+  <div id="scan-shelf-banner" class="scan-shelf-banner hidden"></div>
   <button class="scan-close" onclick="closeScanner()">✕</button>
+  <div class="scan-controls">
+    <button class="scan-ctl" id="scan-torch" onclick="toggleTorch()">🔦 Flash</button>
+    <button class="scan-ctl" onclick="scanTypeISBN()">⌨️ Type ISBN</button>
+  </div>
 </div>
 
 <!-- ===== SHELF DETAIL (full screen) ===== -->
@@ -816,95 +833,225 @@ function jumpToExisting(id){closeModal('modal-book');openDetail(id);}
 // ================================================================
 // SCANNER
 // ================================================================
+// ---- ISBN helpers ----
+function isbn13Valid(s){
+  if(!/^\d{13}$/.test(s))return false;
+  let sum=0;for(let i=0;i<12;i++)sum+=parseInt(s[i])*(i%2?3:1);
+  return (10-(sum%10))%10===parseInt(s[12]);
+}
+function isbn10Valid(s){
+  if(!/^\d{9}[\dXx]$/.test(s))return false;
+  let sum=0;for(let i=0;i<10;i++){const ch=s[i].toUpperCase();sum+=(ch==='X'?10:parseInt(ch))*(10-i);}
+  return sum%11===0;
+}
+function normalizeISBN(raw){
+  const c=String(raw||'').replace(/[^0-9Xx]/g,'');
+  if(c.length===13&&/^97[89]/.test(c)&&isbn13Valid(c))return c;
+  if(c.length===10&&isbn10Valid(c))return c.toUpperCase();
+  return null;
+}
+
+// ---- Scanner state ----
+let scanTrack=null,torchOn=false,scanActive=false,scanTimer=null,scanStatusTimer=null;
+let nativeDetector=null,zxReader=null,zxHints=null,lastScan={code:'',t:0};
+
+function showScanStatus(msg,ms){
+  const el=document.getElementById('scan-status');
+  el.textContent=msg;el.classList.add('show');
+  clearTimeout(scanStatusTimer);
+  if(ms)scanStatusTimer=setTimeout(()=>{
+    if(scanActive){el.textContent='Looking for a barcode…';}else el.classList.remove('show');
+  },ms);
+}
+function loadScript(src){
+  return new Promise((res,rej)=>{const s=document.createElement('script');s.src=src;s.onload=res;s.onerror=()=>rej(new Error('load failed'));document.head.appendChild(s);});
+}
+async function loadZXing(){
+  if(window.ZXing&&ZXing.MultiFormatReader)return true;
+  const urls=[
+    'https://cdn.jsdelivr.net/npm/@zxing/library@0.20.0/umd/index.min.js',
+    'https://unpkg.com/@zxing/library@0.20.0/umd/index.min.js',
+    'https://unpkg.com/@zxing/library@0.20.0',
+    'https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js'
+  ];
+  for(const u of urls){
+    try{await loadScript(u);if(window.ZXing&&ZXing.MultiFormatReader)return true;}catch(e){}
+  }
+  return false;
+}
+
 async function openScanner(mode='book'){
   scanMode=mode;
-  // Detect camera availability first — sandboxed previews (e.g. Claude.ai) block getUserMedia
-  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
-    handleNoCameraAvailable(mode);return;
-  }
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){handleNoCameraAvailable(mode,null);return;}
+  const banner=document.getElementById('scan-shelf-banner');
   if(mode!=='book'){
     const shelf=S.shelves.find(s=>s.id===mode);
-    document.getElementById('scan-shelf-banner').textContent=`Scanning to: ${shelf?shelf.emoji||'🗄️':''} ${shelf?shelf.name:'shelf'}`;
-    document.getElementById('scan-shelf-banner').classList.remove('hidden');
-    document.getElementById('scan-label').textContent='Scan a book barcode — scanner stays open for more';
+    banner.textContent=`Scanning to: ${shelf?(shelf.emoji||'🗄️'):''} ${shelf?shelf.name:'shelf'}`;
+    banner.classList.remove('hidden');
+    document.getElementById('scan-label').textContent='Scan a barcode — the scanner stays open for more books';
   } else {
-    document.getElementById('scan-shelf-banner').classList.add('hidden');
+    banner.classList.add('hidden');
     document.getElementById('scan-label').textContent='Point at the barcode on the back of the book';
   }
   closeModal('modal-book');
-  closeShelfDetail();
+  // Shelf mode: keep the shelf screen open underneath so it refreshes as you scan
+  document.getElementById('scanner-wrap').classList.add('open');
+  showScanStatus('Starting camera…');
   try{
-    const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:1280}}});
+    const stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}}});
     scanStream=stream;
-    const v=document.getElementById('scan-video');v.srcObject=stream;
-    document.getElementById('scanner-wrap').classList.add('open');
-    if('BarcodeDetector' in window){
-      const bd=new BarcodeDetector({formats:['ean_13','ean_8']});
-      scanInterval=setInterval(async()=>{
-        try{const bs=await bd.detect(v);if(bs.length>0)await handleScannedISBN(bs[0].rawValue);}catch(e){}
-      },700);
-    } else {
-      await loadQuagga(v.parentNode);
-    }
+    scanTrack=stream.getVideoTracks()[0];
+    const v=document.getElementById('scan-video');
+    v.srcObject=stream;
+    try{await v.play();}catch(e){}
+    try{await scanTrack.applyConstraints({advanced:[{focusMode:'continuous'}]});}catch(e){}
+    setupTorchButton();
+    await startDetector();
   }catch(err){
-    // NotAllowedError = permission denied; NotFoundError = no camera; SecurityError = sandboxed iframe
-    handleNoCameraAvailable(mode);
+    closeScanner();
+    handleNoCameraAvailable(mode,err);
   }
 }
-function handleNoCameraAvailable(mode){
+function handleNoCameraAvailable(mode,err){
+  const denied=err&&(err.name==='NotAllowedError'||err.name==='SecurityError');
+  const msg=denied?'📷 Camera permission was blocked — allow camera access for this site, or use ISBN / Search':'📷 Camera not available — use ISBN or Search to look up your book';
   if(mode==='book'){
-    // Open add form and explain, then auto-show ISBN panel
     openAddBook();
-    showBanner('📷 Camera not available here — use ISBN or Search below to look up your book','info');
+    showBanner(msg,'info');
     showLookupPanel('isbn');
   } else {
-    // Shelf scan mode — show shelf detail with a message
-    if(currentShelfDetailId)document.getElementById('modal-shelf-detail').classList.add('open');
-    showToast('📷 Camera unavailable — use Add Existing to add books to this shelf');
+    showToast(msg);
   }
 }
-async function loadQuagga(target){
-  if(!window.Quagga){
-    await new Promise((res,rej)=>{const s=document.createElement('script');s.src='https://cdnjs.cloudflare.com/ajax/libs/quagga/0.12.1/quagga.min.js';s.onload=res;s.onerror=rej;document.head.appendChild(s);});
+
+async function startDetector(){
+  nativeDetector=null;
+  if('BarcodeDetector' in window){
+    try{
+      const fmts=await BarcodeDetector.getSupportedFormats();
+      if(fmts.includes('ean_13'))nativeDetector=new BarcodeDetector({formats:['ean_13']});
+    }catch(e){}
   }
-  Quagga.init({inputStream:{name:'Live',type:'LiveStream',target,constraints:{facingMode:'environment'}},decoder:{readers:['ean_reader','ean_8_reader']}},err=>{
-    if(err){showToast('Scanner unavailable. Use Enter ISBN.');closeScanner();if(scanMode==='book')openAddBook();return;}
-    Quagga.start();
-    Quagga.onDetected(async r=>{await handleScannedISBN(r.codeResult.code);});
-  });
+  if(!nativeDetector){
+    showScanStatus('Loading scanner…');
+    const ok=await loadZXing();
+    if(!scanStream)return; // closed while loading
+    if(!ok){showScanStatus('Scanner could not load — check your connection, or tap Type ISBN.');return;}
+    zxReader=new ZXing.MultiFormatReader();
+    zxHints=new Map();
+    zxHints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS,[ZXing.BarcodeFormat.EAN_13]);
+    zxHints.set(ZXing.DecodeHintType.TRY_HARDER,true);
+  }
+  scanActive=true;
+  showScanStatus('Looking for a barcode…');
+  scheduleScan(150);
+}
+function scheduleScan(delay){
+  clearTimeout(scanTimer);
+  if(!scanActive)return;
+  scanTimer=setTimeout(scanTick,delay);
+}
+function decodeFrameZXing(v){
+  const c=document.getElementById('scan-canvas');
+  const vw=v.videoWidth,vh=v.videoHeight;
+  const sw=Math.round(vw*0.92);
+  const sh=Math.round(vh*(vw<vh?0.4:0.6));
+  const sx=Math.round((vw-sw)/2),sy=Math.round((vh-sh)/2);
+  const scale=Math.min(1,960/sw);
+  c.width=Math.round(sw*scale);c.height=Math.round(sh*scale);
+  const ctx=c.getContext('2d',{willReadFrequently:true});
+  ctx.drawImage(v,sx,sy,sw,sh,0,0,c.width,c.height);
+  try{
+    const src=new ZXing.HTMLCanvasElementLuminanceSource(c);
+    const bmp=new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(src));
+    return zxReader.decode(bmp,zxHints).getText();
+  }catch(e){return null;} // NotFound / checksum errors are normal between frames
+}
+async function scanTick(){
+  if(!scanActive||!scanStream)return;
+  const v=document.getElementById('scan-video');
+  if(v.readyState<2||!v.videoWidth){scheduleScan(200);return;}
+  let code=null;
+  try{
+    if(nativeDetector){const bs=await nativeDetector.detect(v);if(bs.length)code=bs[0].rawValue;}
+    else code=decodeFrameZXing(v);
+  }catch(e){}
+  if(code)await onBarcode(code);
+  scheduleScan(nativeDetector?250:220);
+}
+async function onBarcode(raw){
+  const code=String(raw).replace(/[^0-9Xx]/g,'');
+  const now=Date.now();
+  if(code===lastScan.code&&now-lastScan.t<4000)return; // same barcode still in view
+  lastScan={code,t:now};
+  const isbn=normalizeISBN(code);
+  if(!isbn){showScanStatus(`Read ${code} — not a book ISBN. Aim at the barcode starting with 978 or 979.`,3500);return;}
+  if(navigator.vibrate)navigator.vibrate(60);
+  await handleScannedISBN(isbn);
 }
 async function handleScannedISBN(isbn){
   if(scanMode==='book'){
-    // Single book mode — close scanner, open form
     closeScanner();
     openAddBook();
     await fetchISBN(isbn,true);
   } else {
-    // Shelf scan mode — stay open, add book to shelf
-    const shelfId=scanMode;
-    if(scanInterval)clearInterval(scanInterval); // pause briefly to debounce
-    showToast('🔍 Looking up book…');
-    const book=await fetchISBNSilent(isbn,shelfId);
+    showScanStatus(`Found ${isbn} — looking it up…`);
+    const book=await fetchISBNSilent(isbn,scanMode);
     if(book){
-      showToast(`✅ "${book.title}" added to shelf`);
-      renderShelfDetailBooks();
+      showScanStatus(`✅ Added: ${book.title}`,2500);
+      renderShelfDetailBooks();renderShelves();
+    } else {
+      showScanStatus('Ready for the next book…',1500);
     }
-    // Resume scanning after short pause
-    setTimeout(()=>{
-      if(scanStream&&document.getElementById('scanner-wrap').classList.contains('open')){
-        if('BarcodeDetector' in window){
-          const v=document.getElementById('scan-video');
-          const bd=new BarcodeDetector({formats:['ean_13','ean_8']});
-          scanInterval=setInterval(async()=>{try{const bs=await bd.detect(v);if(bs.length>0)await handleScannedISBN(bs[0].rawValue);}catch(e){}},700);
-        }
-      }
-    },1800);
   }
 }
+function scanTypeISBN(){
+  if(scanMode==='book'){closeScanner();openAddBook();showLookupPanel('isbn');return;}
+  const raw=prompt('Type the ISBN (10 or 13 digits):');
+  if(!raw)return;
+  const isbn=normalizeISBN(raw);
+  if(!isbn){showToast("That doesn't look like a valid ISBN");return;}
+  handleScannedISBN(isbn);
+}
+
+// ---- Flash / torch ----
+function setupTorchButton(){
+  const btn=document.getElementById('scan-torch');
+  let supported=false;
+  try{const caps=scanTrack&&scanTrack.getCapabilities?scanTrack.getCapabilities():{};supported=!!caps.torch;}catch(e){}
+  torchOn=false;
+  btn.dataset.supported=supported?'1':'0';
+  btn.classList.remove('on');
+  btn.classList.toggle('unsupported',!supported);
+  btn.textContent='🔦 Flash';
+}
+async function toggleTorch(){
+  const btn=document.getElementById('scan-torch');
+  if(!scanTrack||btn.dataset.supported!=='1'){
+    showScanStatus("This browser doesn't let web apps control the flash. Try brighter light, or tilt the book to avoid glare.",5000);
+    return;
+  }
+  const next=!torchOn;
+  try{
+    await scanTrack.applyConstraints({advanced:[{torch:next}]});
+    torchOn=next;
+    btn.classList.toggle('on',torchOn);
+    btn.textContent=torchOn?'🔦 Flash on':'🔦 Flash';
+  }catch(e){
+    showScanStatus("Flash isn't available on this camera.",3500);
+  }
+}
+
 function closeScanner(){
-  if(scanInterval){clearInterval(scanInterval);scanInterval=null;}
+  scanActive=false;
+  clearTimeout(scanTimer);scanTimer=null;
+  clearTimeout(scanStatusTimer);
+  if(scanTrack&&torchOn){try{scanTrack.applyConstraints({advanced:[{torch:false}]});}catch(e){}}
+  torchOn=false;
   if(scanStream){scanStream.getTracks().forEach(t=>t.stop());scanStream=null;}
-  if(window.Quagga){try{Quagga.stop();}catch(e){}}
+  scanTrack=null;
+  const v=document.getElementById('scan-video');if(v)v.srcObject=null;
+  document.getElementById('scan-status').classList.remove('show');
   document.getElementById('scanner-wrap').classList.remove('open');
 }
 
@@ -1150,6 +1297,7 @@ async function lookupISBN(isbn){
 }
 
 let pendingEditions=[];
+let nextBookScanned=false;
 function showEditionPicker(editions,scanned){
   pendingEditions=editions;
   document.getElementById('editions-list').innerHTML=editions.map((e,i)=>`
@@ -1182,6 +1330,7 @@ function applyBookData(data,scanned){
   document.getElementById('b-genre').value=data.genre||'';
   document.getElementById('b-cover').value=data.cover||'';
   if(scanned&&editBookId){const b=S.books.find(b=>b.id===editBookId);if(b)b.scanned=true;}
+  if(scanned)nextBookScanned=true;
   checkDuplicate();
 }
 
@@ -1189,7 +1338,7 @@ function applyBookData(data,scanned){
 // BOOKS
 // ================================================================
 function openAddBook(preShelfId){
-  editBookId=null;bookRating=0;editTags=[];
+  editBookId=null;bookRating=0;editTags=[];nextBookScanned=false;
   document.getElementById('book-modal-title').textContent='Add a Book 📖';
   ['b-title','b-author','b-genre','b-isbn','b-cover','b-review'].forEach(id=>document.getElementById(id).value='');
   document.getElementById('b-pages').value='';document.getElementById('b-progress').value='';
@@ -1259,7 +1408,7 @@ function saveBook(){
     dateStart:document.getElementById('b-date-start').value,
     dateEnd:document.getElementById('b-date-end').value,
     added:editBookId?(ex.added||new Date().toISOString()):new Date().toISOString(),
-    scanned:ex.scanned||false,
+    scanned:ex.scanned||nextBookScanned,
     tags:[...editTags],
     shelfIds,
   };
@@ -1833,6 +1982,7 @@ function render(){renderBooks();renderTagChipsLib();renderProfile();}
 // INIT
 // ================================================================
 load();createPetals();render();
+if(!('BarcodeDetector' in window))setTimeout(()=>{loadZXing();},3000);
 </script>
 </body>
 </html>
