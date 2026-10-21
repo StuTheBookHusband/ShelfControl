@@ -883,6 +883,43 @@ async function loadZXing(){
   return false;
 }
 
+// ---- Engine 2: barcode-detector (ZXing-C++ compiled to WebAssembly) — the iPhone fix ----
+let scanEngine='',wasmDetector=null,wasmReady=null,wasmErrors=0;
+function withTimeout(promise,ms){
+  return Promise.race([promise,new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),ms))]);
+}
+function loadWasmDetector(){
+  if(wasmReady)return wasmReady;
+  wasmReady=(async()=>{
+    try{
+      if(!(window.BarcodeDetectionAPI&&window.BarcodeDetectionAPI.BarcodeDetector)){
+        const urls=[
+          'https://cdn.jsdelivr.net/npm/barcode-detector@3.2.1/dist/iife/ponyfill.min.js',
+          'https://unpkg.com/barcode-detector@3.2.1/dist/iife/ponyfill.min.js'
+        ];
+        for(const u of urls){
+          try{await withTimeout(loadScript(u),12000);}catch(e){}
+          if(window.BarcodeDetectionAPI&&window.BarcodeDetectionAPI.BarcodeDetector)break;
+        }
+      }
+      const API=window.BarcodeDetectionAPI;
+      if(!API||!API.BarcodeDetector)throw new Error('library not loaded');
+      const det=new API.BarcodeDetector({formats:['ean_13']});
+      // Warm-up on a blank image: this downloads and starts the WASM decoder
+      const w=document.createElement('canvas');w.width=w.height=64;
+      const wx=w.getContext('2d');wx.fillStyle='#fff';wx.fillRect(0,0,64,64);
+      await withTimeout(det.detect(w),25000);
+      wasmDetector=det;
+      return true;
+    }catch(e){
+      console.error('WASM detector failed to load',e);
+      wasmReady=null;
+      return false;
+    }
+  })();
+  return wasmReady;
+}
+
 function initZXing(){
   if(zxReader)return;
   zxReader=new ZXing.MultiFormatReader();
@@ -935,20 +972,25 @@ function handleNoCameraAvailable(mode,err){
 }
 
 async function startDetector(){
-  nativeDetector=null;
+  nativeDetector=null;scanEngine='';wasmErrors=0;
   if('BarcodeDetector' in window){
     try{
       const fmts=await BarcodeDetector.getSupportedFormats();
-      if(fmts.includes('ean_13'))nativeDetector=new BarcodeDetector({formats:['ean_13']});
+      if(fmts.includes('ean_13')){nativeDetector=new BarcodeDetector({formats:['ean_13']});scanEngine='native';}
     }catch(e){}
   }
-  if(!nativeDetector){
+  if(!scanEngine){
     showScanStatus('Loading scanner…');
-    const ok=await loadZXing();
-    if(!scanStream)return; // closed while loading
-    if(!ok){showScanStatus('Scanner could not load — check your connection, or tap Type ISBN.');return;}
-    initZXing();
+    if(await loadWasmDetector()){scanEngine='wasm';}
+    else{
+      showScanStatus('Switching to backup scanner…');
+      const ok=await loadZXing();
+      if(!scanStream)return; // closed while loading
+      if(!ok){showScanStatus('Scanner could not load — check your connection, or tap ISBN.');return;}
+      initZXing();scanEngine='js';
+    }
   }
+  if(!scanStream)return;
   scanTipAt=Date.now();scanTipIdx=0;scanResizes=0;
   scanActive=true;
   showScanStatus('Looking for a barcode…');
@@ -1012,6 +1054,33 @@ function decodeFrameZXing(v,pass){
   if(boost)stretchContrast(cv);
   return decodeCanvasZXing(cv);
 }
+const ENGINE_LABEL={native:'native',wasm:'ZXing-C++',js:'ZXing-JS'};
+let scanDbgN=0;
+async function decodeFrameWasm(v){
+  const cv=document.getElementById('scan-canvas');
+  const vw=v.videoWidth,vh=v.videoHeight,portrait=vw<vh;
+  const ctx=cv.getContext('2d',{willReadFrequently:true});
+  for(const kind of ['band','full']){
+    let sy=0,sh=vh;
+    if(kind==='band'){const f=portrait?0.45:0.6;sh=Math.round(vh*f);sy=Math.round((vh-sh)/2);}
+    const scale=Math.min(1,1600/Math.max(vw,sh));
+    cv.width=Math.max(1,Math.round(vw*scale));cv.height=Math.max(1,Math.round(sh*scale));
+    ctx.drawImage(v,0,sy,vw,sh,0,0,cv.width,cv.height);
+    if(kind==='band'&&scanDbgN++%8===0)scanDebug=`${ENGINE_LABEL[scanEngine]} · camera ${vw}×${vh} · view changes: ${scanResizes} · brightness ${frameBrightness(cv)}`;
+    const res=await wasmDetector.detect(cv);
+    if(res&&res.length){
+      const values=res.map(r=>r.rawValue);
+      return values.find(x=>normalizeISBN(x))||values[0];
+    }
+  }
+  return null;
+}
+async function fallbackToJS(){
+  if(scanEngine==='js')return;
+  scanEngine='js';
+  showScanStatus('Switching to backup scanner…');
+  if(await loadZXing())initZXing();
+}
 const SCAN_TIPS=[
   'Hold the phone about 6–8 inches away until the bars look sharp.',
   'Need light? Move near a lamp and tilt the book to avoid glare.',
@@ -1030,11 +1099,21 @@ async function scanTick(){
   if(v.readyState<2||!v.videoWidth){scheduleScan(200);return;}
   let code=null;
   try{
-    if(nativeDetector){const bs=await nativeDetector.detect(v);if(bs.length)code=bs[0].rawValue;}
-    else code=decodeFrameZXing(v,scanPass++);
-  }catch(e){}
+    if(scanEngine==='native'){
+      if(scanDbgN++%8===0)scanDebug=`native · camera ${v.videoWidth}×${v.videoHeight} · view changes: ${scanResizes}`;
+      const bs=await nativeDetector.detect(v);if(bs.length)code=bs[0].rawValue;
+    }
+    else if(scanEngine==='wasm')code=await decodeFrameWasm(v);
+    else{
+      scanDebug=scanDebug||'ZXing-JS backup';
+      code=decodeFrameZXing(v,scanPass++);
+    }
+  }catch(e){
+    console.error(e);
+    if(scanEngine==='wasm'&&++wasmErrors>=5)fallbackToJS();
+  }
   if(code)await onBarcode(code);else maybeShowScanTip();
-  scheduleScan(nativeDetector?250:200);
+  scheduleScan(scanEngine==='js'?200:250);
 }
 async function onBarcode(raw){
   const code=String(raw).replace(/[^0-9Xx]/g,'');
@@ -1081,8 +1160,8 @@ function scanTakePhoto(){
   startPhotoScan(mode);
 }
 async function decodePhotoFile(file){
-  if(!(await loadZXing()))throw new Error('decoder not loaded');
-  initZXing();
+  const zxOk=await loadZXing();
+  if(zxOk)initZXing();
   const url=URL.createObjectURL(file);
   try{
     const img=await new Promise((res,rej)=>{const i=new Image();i.onload=()=>res(i);i.onerror=rej;i.src=url;});
@@ -1090,6 +1169,19 @@ async function decodePhotoFile(file){
     const cv=document.getElementById('scan-canvas');
     const ctx=cv.getContext('2d',{willReadFrequently:true});
     ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality='high';
+    if(await loadWasmDetector()){
+      for(const md of [2000,1400]){
+        const sc=Math.min(1,md/Math.max(W,H));
+        cv.width=Math.round(W*sc);cv.height=Math.round(H*sc);
+        ctx.drawImage(img,0,0,cv.width,cv.height);
+        try{
+          const res=await wasmDetector.detect(cv);
+          const hit=(res||[]).map(r=>normalizeISBN(r.rawValue)).find(Boolean);
+          if(hit)return hit;
+        }catch(e){console.error(e);}
+      }
+    }
+    if(!zxOk)return null;
     const crops=[[0,0,1,1],[0.08,0.2,0.84,0.6],[0.15,0.35,0.7,0.3]];
     for(const md of [1800,1200,2600]){
       for(const [cx,cy,cw,ch] of crops){
@@ -2096,7 +2188,7 @@ function render(){renderBooks();renderTagChipsLib();renderProfile();}
 // INIT
 // ================================================================
 load();createPetals();render();
-if(!('BarcodeDetector' in window))setTimeout(()=>{loadZXing();},3000);
+if(!('BarcodeDetector' in window)){setTimeout(()=>{loadWasmDetector();},1500);setTimeout(()=>{loadZXing();},6000);}
 </script>
 </body>
 </html>
