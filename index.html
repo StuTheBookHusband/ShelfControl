@@ -497,11 +497,12 @@ body{font-family:'Lato',sans-serif;background:var(--plum);color:var(--text-prima
     <div class="modal-handle"></div>
     <div class="modal-title" id="book-modal-title">Add a Book 📖</div>
     <div class="lookup-banner" id="lookup-banner"></div>
-    <div style="display:flex;gap:7px;margin-bottom:10px">
-      <button class="btn btn-secondary" style="flex:1;font-size:11px;padding:9px 6px" onclick="openScanner()">📷 Scan</button>
-      <button class="btn btn-secondary" style="flex:1;font-size:11px;padding:9px 6px" onclick="startPhotoScan('book')">📸 Photo</button>
-      <button class="btn btn-secondary" style="flex:1;font-size:11px;padding:9px 6px" onclick="showLookupPanel('isbn')">🔢 ISBN</button>
-      <button class="btn btn-secondary" style="flex:1;font-size:11px;padding:9px 6px" onclick="showLookupPanel('search')">🔍 Search</button>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-bottom:10px">
+      <button class="btn btn-secondary" style="font-size:11px;padding:9px 6px" onclick="openScanner()">📷 Scan</button>
+      <button class="btn btn-secondary" style="font-size:11px;padding:9px 6px" onclick="startPhotoScan('book')">📸 Photo</button>
+      <button class="btn btn-secondary" style="font-size:11px;padding:9px 6px" onclick="showLookupPanel('isbn')">🔢 ISBN</button>
+      <button class="btn btn-secondary" style="font-size:11px;padding:9px 6px" onclick="showLookupPanel('search')">🔍 Search</button>
+      <button class="btn btn-secondary" style="font-size:11px;padding:9px 6px" onclick="startCoverScan()">🖼️ Cover</button>
     </div>
     <div id="isbn-inline" class="hidden" style="display:flex;gap:7px;margin-bottom:12px">
       <input type="text" id="isbn-inline-val" placeholder="ISBN (10 or 13 digits)" inputmode="numeric" style="flex:1;background:var(--plum);border:1px solid var(--card-border);border-radius:10px;padding:10px 12px;color:var(--text-primary);font-family:'Lato',sans-serif;font-size:14px;outline:none" onkeydown="if(event.key==='Enter')doISBNLookup()">
@@ -567,6 +568,25 @@ body{font-family:'Lato',sans-serif;background:var(--plum);color:var(--text-prima
     <div id="del-book-wrap" class="hidden"><div class="divider"></div>
       <button class="btn btn-full" style="background:transparent;color:#e05070;border:1px solid #5a2030" onclick="deleteBook()">Delete Book</button>
     </div>
+  </div>
+</div>
+
+<!-- ===== COVER SCAN ===== -->
+<input type="file" id="cover-photo" accept="image/*" style="display:none" onchange="handleCoverPhoto(event)">
+<div class="modal-overlay" id="modal-cover">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <div class="modal-title">Find by Cover 🖼️</div>
+    <div class="lookup-banner" id="cover-status"></div>
+    <div class="field"><label>Text read from the cover (edit if needed)</label>
+      <input type="text" id="cover-text" placeholder="Title and author…" onkeydown="if(event.key==='Enter')coverSearchText()">
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:12px">
+      <button class="btn btn-secondary" style="flex:1;font-size:13px" onclick="coverPhotoAgain()">📸 Retake</button>
+      <button class="btn btn-primary" style="flex:1;font-size:13px" onclick="coverSearchText()">🔍 Search</button>
+    </div>
+    <div id="cover-results"></div>
+    <button class="btn btn-secondary btn-full" style="margin-top:4px" onclick="closeModal('modal-cover')">Cancel</button>
   </div>
 </div>
 
@@ -1134,7 +1154,7 @@ async function handleScannedISBN(isbn){
     showScanStatus(`Found ${isbn} — looking it up…`);
     const book=await fetchISBNSilent(isbn,scanMode);
     if(book){
-      showScanStatus(`✅ Added: ${book.title}`,2500);
+      showScanStatus(book.needsInfo?`📝 Saved a placeholder for ${isbn} — add details later`:`✅ Added: ${book.title}`,2500);
       renderShelfDetailBooks();renderShelves();
     } else {
       showScanStatus('Ready for the next book…',1500);
@@ -1214,7 +1234,7 @@ async function handlePhotoScan(e){
   if(photoMode==='book'){await fetchISBN(isbn,true);}
   else{
     const book=await fetchISBNSilent(isbn,photoMode);
-    if(book){showToast(`✅ Added: ${book.title}`);renderShelfDetailBooks();renderShelves();}
+    if(book){showToast(book.needsInfo?'📝 Saved a placeholder — add details later':`✅ Added: ${book.title}`);renderShelfDetailBooks();renderShelves();}
   }
 }
 
@@ -1262,6 +1282,251 @@ function closeScanner(){
 }
 
 // ================================================================
+// COVER SCAN: photo of the front cover -> read the text (OCR) -> search Google Books
+// ================================================================
+let ocrWorker=null,coverResults=[],coverBusy=false,ocrLabel='Reading cover…';
+const TESS_URLS=[
+  'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js',
+  'https://unpkg.com/tesseract.js@5.1.1/dist/tesseract.min.js'
+];
+const COVER_STOPWORDS=new Set(['the','and','for','with','novel','new','york','times','bestselling','best','selling','author','from','book','series','that','this','her','his','who','are','you','not','one','all','has','was','will']);
+
+function coverStatus(msg,type){
+  const el=document.getElementById('cover-status');
+  if(!msg){el.classList.remove('show');return;}
+  el.textContent=msg;el.className='lookup-banner show';
+  el.style.background=type==='error'?'rgba(224,80,112,.15)':'rgba(196,120,138,.15)';
+  el.style.borderColor=type==='error'?'rgba(224,80,112,.3)':'rgba(196,120,138,.3)';
+  el.style.color=type==='error'?'#e05070':'var(--rose-light)';
+}
+function startCoverScan(){document.getElementById('cover-photo').click();}
+function coverPhotoAgain(){document.getElementById('cover-photo').click();}
+async function handleCoverPhoto(e){
+  const file=e.target.files&&e.target.files[0];
+  e.target.value='';
+  if(!file)return;
+  coverResults=[];
+  document.getElementById('cover-results').innerHTML='';
+  document.getElementById('modal-cover').classList.add('open');
+  await runCoverOCR(file);
+}
+
+function invertCanvas(src){
+  const c=document.createElement('canvas');c.width=src.width;c.height=src.height;
+  const x=c.getContext('2d',{willReadFrequently:true});x.drawImage(src,0,0);
+  const d=x.getImageData(0,0,c.width,c.height),a=d.data;
+  for(let i=0;i<a.length;i+=4){a[i]=255-a[i];a[i+1]=255-a[i+1];a[i+2]=255-a[i+2];}
+  x.putImageData(d,0,0);return c;
+}
+async function prepCoverCanvases(file){
+  const url=URL.createObjectURL(file);
+  try{
+    const img=await new Promise((res,rej)=>{const i=new Image();i.onload=()=>res(i);i.onerror=rej;i.src=url;});
+    const sc=Math.min(1,1400/Math.max(img.naturalWidth,img.naturalHeight));
+    const a=document.createElement('canvas');
+    a.width=Math.round(img.naturalWidth*sc);a.height=Math.round(img.naturalHeight*sc);
+    a.getContext('2d',{willReadFrequently:true}).drawImage(img,0,0,a.width,a.height);
+    stretchContrast(a);            // greyscale + stronger contrast
+    return [a,invertCanvas(a)];    // second copy helps with light text on dark covers
+  }finally{URL.revokeObjectURL(url);}
+}
+function ocrLog(m){
+  if(!m||typeof m.progress!=='number')return;
+  const pct=Math.round(m.progress*100),st=String(m.status||'');
+  if(/loading|initializ/i.test(st))coverStatus(`Downloading text reader (first time only)… ${pct}%`);
+  else if(/recogniz/i.test(st))coverStatus(`${ocrLabel} ${pct}%`);
+}
+async function getOcrWorker(){
+  if(!window.Tesseract){
+    for(const u of TESS_URLS){
+      try{await withTimeout(loadScript(u),20000);}catch(e){}
+      if(window.Tesseract)break;
+    }
+    if(!window.Tesseract)throw new Error('text reader could not load');
+  }
+  coverStatus('Loading text reader (first time only)…');
+  const w=await withTimeout(Tesseract.createWorker('eng',1,{logger:ocrLog}),120000);
+  try{await w.setParameters({tessedit_pageseg_mode:(Tesseract.PSM&&Tesseract.PSM.SPARSE_TEXT)||'11'});}catch(e){}
+  ocrWorker=w;
+  return w;
+}
+function terminateOcr(){
+  if(!ocrWorker)return;
+  const w=ocrWorker;ocrWorker=null;
+  try{Promise.resolve(w.terminate()).catch(()=>{});}catch(e){}
+}
+function ocrLines(data){
+  let lines=data&&data.lines;
+  if(!lines&&data&&data.blocks){lines=[];data.blocks.forEach(b=>(b.paragraphs||[]).forEach(p=>(p.lines||[]).forEach(l=>lines.push(l))));}
+  return (lines||[]).map(l=>({
+    text:String(l.text||'').replace(/[^\p{L}\p{N}'&\- ]+/gu,' ').replace(/\s+/g,' ').trim(),
+    conf:l.confidence||0,
+    h:l.bbox?(l.bbox.y1-l.bbox.y0):0
+  })).filter(l=>l.conf>=40&&/\p{L}{3}/u.test(l.text));
+}
+function dedupeLines(lines){
+  const seen=new Set();
+  return lines.filter(l=>{const k=l.text.toLowerCase();if(seen.has(k))return false;seen.add(k);return true;});
+}
+function coverQueries(lines){
+  const byH=[...lines].sort((a,b)=>b.h-a.h);
+  const top=n=>byH.slice(0,n).map(l=>l.text).join(' ');
+  const words=lines.map(l=>l.text).join(' ').split(' ').filter(w=>w.length>2).slice(0,12).join(' ');
+  return [...new Set([top(2),top(1),top(3),words].map(q=>q.trim()).filter(q=>q.length>=4))];
+}
+function coverTokens(str){
+  return [...new Set(String(str||'').toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(t=>t.length>=3&&!COVER_STOPWORDS.has(t)))];
+}
+function scoreBook(b,tokens){
+  const hay=`${b.title} ${b.subtitle||''} ${b.author}`.toLowerCase();
+  return tokens.filter(t=>hay.includes(t)).length+(b.cover?0.5:0);
+}
+function gbItemToBook(item){
+  const v=item.volumeInfo||{},ids=v.industryIdentifiers||[];
+  const isbn=(ids.find(x=>x.type==='ISBN_13')||ids.find(x=>x.type==='ISBN_10')||{}).identifier||'';
+  const img=v.imageLinks?(v.imageLinks.thumbnail||v.imageLinks.smallThumbnail||''):'';
+  return {
+    title:v.title||'',subtitle:v.subtitle||'',author:(v.authors||[]).join(', '),
+    pages:v.pageCount||0,isbn,
+    cover:img.replace('&edge=curl','').replace(/^http:/,'https:'),
+    publisher:v.publisher||'',year:v.publishedDate?v.publishedDate.slice(0,4):'',
+    genre:(v.categories||[]).slice(0,3).join(', ')
+  };
+}
+// Optional Google Books API key (restrict it to this site's address in Google Cloud). Empty = keyless.
+const GB_KEY='';
+let lookupNotes=[];
+// Google Books fetch that tells "busy / rate-limited" apart from "no results"
+async function gbFetch(q,max){
+  const url=`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&maxResults=${max||5}&printType=books${GB_KEY?'&key='+GB_KEY:''}`;
+  for(let attempt=0;attempt<2;attempt++){
+    try{
+      const r=await fetch(url);
+      let d=null;try{d=await r.json();}catch(e){}
+      const busy=r.status===429||(d&&d.error&&(d.error.code===429||/quota|rate/i.test(JSON.stringify(d.error))));
+      if(busy){
+        if(attempt===0){await new Promise(res=>setTimeout(res,1200));continue;}
+        return {items:[],error:'busy'};
+      }
+      if(!r.ok)return {items:[],error:'http'};
+      return {items:(d&&d.items)||[]};
+    }catch(e){
+      if(attempt===1)return {items:[],error:'network'};
+    }
+  }
+  return {items:[],error:'network'};
+}
+function isbn13to10(i13){
+  if(!/^978\d{10}$/.test(i13))return null;
+  const b=i13.slice(3,12);let s=0;for(let i=0;i<9;i++)s+=parseInt(b[i])*(10-i);
+  const k=(11-(s%11))%11;return b+(k===10?'X':String(k));
+}
+function isbn10to13(i10){
+  if(!/^\d{9}[\dX]$/i.test(i10))return null;
+  const b='978'+i10.slice(0,9);let s=0;for(let i=0;i<12;i++)s+=parseInt(b[i])*(i%2?3:1);
+  return b+String((10-(s%10))%10);
+}
+function altISBN(isbn){return isbn.length===13?isbn13to10(isbn):isbn10to13(isbn);}
+async function gbSearch(q){
+  const r=await gbFetch(q,10);
+  return (r.items||[]).map(gbItemToBook).filter(b=>b.title);
+}
+async function olSearch(q){
+  const r=await fetch(`https://openlibrary.org/search.json?q=${encodeURIComponent(q)}&limit=10&fields=title,author_name,isbn,cover_i,number_of_pages_median,first_publish_year,publisher,subject`);
+  const d=await r.json();
+  return (d.docs||[]).map(doc=>({
+    title:doc.title||'',subtitle:'',
+    author:(doc.author_name||[]).slice(0,2).join(', '),
+    pages:doc.number_of_pages_median||0,
+    isbn:(doc.isbn||[]).find(x=>x.length===13)||(doc.isbn||[])[0]||'',
+    cover:doc.cover_i?`https://covers.openlibrary.org/b/id/${doc.cover_i}-M.jpg`:'',
+    publisher:(doc.publisher||[])[0]||'',
+    year:doc.first_publish_year||'',
+    genre:(doc.subject||[]).slice(0,3).join(', ')
+  })).filter(b=>b.title);
+}
+function normKey(b){
+  const t=(b.title||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+  const a=(b.author||'').toLowerCase().replace(/[^a-z0-9 ]+/g,' ').trim().split(/\s+/).pop()||'';
+  return t+'|'+a;
+}
+// Combine results from several sources, collapsing duplicates and filling gaps (cover, ISBN, pages…)
+function mergeBooks(list){
+  const map=new Map();
+  for(const b of list){
+    const k=normKey(b),cur=map.get(k);
+    if(!cur){map.set(k,{...b});continue;}
+    for(const f of ['isbn','cover','pages','publisher','year','genre','author'])if(!cur[f]&&b[f])cur[f]=b[f];
+  }
+  return [...map.values()];
+}
+async function searchAllSources(q){
+  const [g,o]=await Promise.all([gbSearch(q).catch(()=>[]),olSearch(q).catch(()=>[])]);
+  return mergeBooks([...g,...o]);
+}
+async function searchCover(queries,tokens){
+  try{
+    const lists=await Promise.all(queries.map(q=>searchAllSources(q).catch(()=>[])));
+    const all=mergeBooks(lists.flat());
+    all.forEach(b=>{b._score=scoreBook(b,tokens);});
+    all.sort((x,y)=>y._score-x._score);
+    coverResults=all.slice(0,8);
+    renderCoverResults();
+  }catch(e){coverStatus('Search failed — check your connection','error');}
+}
+function renderCoverResults(){
+  const el=document.getElementById('cover-results');
+  if(!coverResults.length){el.innerHTML='';coverStatus('No matches found. Edit the text above and tap Search.','error');return;}
+  coverStatus(coverResults[0]._score>=2?'Is this your book? Tap to select.':'Not sure — compare the covers and pick the closest, or edit the text above.');
+  el.innerHTML=coverResults.map((b,i)=>`<div class="edition-card" onclick="pickCoverResult(${i})">
+    ${b.cover?`<img src="${esc(b.cover)}" class="edition-cover" onerror="this.style.display='none'">`:`<div class="edition-cover-ph">📕</div>`}
+    <div style="flex:1;min-width:0">
+      <div class="edition-title">${esc(b.title)}</div>
+      <div class="edition-meta">${b.author?`by ${esc(b.author)}<br>`:''}${[b.publisher,b.year,b.pages?b.pages+' pages':''].filter(Boolean).map(x=>esc(String(x))).join(' · ')}</div>
+    </div></div>`).join('');
+}
+function pickCoverResult(i){
+  const b=coverResults[i];if(!b)return;
+  closeModal('modal-cover');
+  applyBookData({title:b.title,author:b.author,pages:b.pages,isbn:b.isbn,genre:b.genre,cover:b.cover},false);
+  showBanner('✅ Book details loaded — double-check the edition');
+}
+async function coverSearchText(){
+  const q=document.getElementById('cover-text').value.trim();
+  if(q.length<3){showToast('Type a title or author first');return;}
+  coverStatus('Searching books…');
+  await searchCover([q],coverTokens(q));
+}
+async function runCoverOCR(file){
+  if(coverBusy)return;
+  coverBusy=true;
+  let lines=[];
+  try{
+    coverStatus('Preparing photo…');
+    const [norm,inv]=await prepCoverCanvases(file);
+    const worker=await getOcrWorker();
+    for(const [label,cv] of [['Reading cover…',norm],['Checking light-on-dark text…',inv]]){
+      ocrLabel=label;
+      const res=await withTimeout(worker.recognize(cv),90000);
+      lines=lines.concat(ocrLines(res.data));
+    }
+  }catch(err){
+    console.error(err);
+    coverStatus('Could not read the cover automatically. Type the title below and tap Search.','error');
+    return;
+  }finally{
+    coverBusy=false;
+    terminateOcr();
+  }
+  lines=dedupeLines(lines);
+  if(!lines.length){coverStatus("Couldn't find readable text. Try a straight-on photo in good light, or type the title below.",'error');return;}
+  const queries=coverQueries(lines);
+  document.getElementById('cover-text').value=queries[0]||'';
+  coverStatus('Searching books…');
+  await searchCover(queries,coverTokens(lines.map(l=>l.text).join(' ')));
+}
+
+// ================================================================
 // LOOKUP PANEL SWITCHER
 // ================================================================
 function showLookupPanel(panel){
@@ -1292,49 +1557,32 @@ async function doTitleSearch(){
   const q=document.getElementById('search-inline-val').value.trim();
   if(!q){showToast('Enter a title or author name');return;}
   const res=document.getElementById('search-results');
-  res.innerHTML=`<div style="text-align:center;padding:14px;font-size:12px;color:var(--text-secondary)">🔍 Searching…</div>`;
+  res.innerHTML=`<div style="text-align:center;padding:14px;font-size:12px;color:var(--text-secondary)">🔍 Searching Google Books and Open Library…</div>`;
   try{
-    const r=await fetch(`https://openlibrary.org/search.json?q=${encodeURIComponent(q)}&limit=10&fields=title,author_name,isbn,cover_i,number_of_pages_median,first_publish_year,subject`);
-    const data=await r.json();
-    if(!data.docs||!data.docs.length){res.innerHTML=`<div style="text-align:center;padding:14px;font-size:12px;color:var(--text-muted)">No results found — try a different title or author</div>`;return;}
-    res.innerHTML=data.docs.map((doc,i)=>{
-      const cover=doc.cover_i?`https://covers.openlibrary.org/b/id/${doc.cover_i}-S.jpg`:'';
-      const author=(doc.author_name||[]).slice(0,2).join(', ');
-      const isbn=(doc.isbn||[])[0]||'';
-      return `<div onclick="selectSearchResult(${i})" style="display:flex;gap:10px;align-items:center;padding:10px 11px;border-radius:10px;cursor:pointer;border:1px solid var(--card-border);margin-bottom:6px;background:var(--plum);transition:border-color .15s" onmousedown="this.style.borderColor='var(--rose)'" onmouseup="this.style.borderColor='var(--card-border)'">
-        ${cover?`<img src="${cover}" style="width:34px;height:48px;border-radius:4px;object-fit:cover;flex-shrink:0" onerror="this.style.display='none'">`:`<div style="width:34px;height:48px;border-radius:4px;background:var(--plum-light);display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0">📕</div>`}
+    let books=await searchAllSources(q);
+    const tokens=coverTokens(q);
+    if(tokens.length){books.forEach(b=>{b._score=scoreBook(b,tokens);});books.sort((x,y)=>y._score-x._score);}
+    books=books.slice(0,10);
+    if(!books.length){res.innerHTML=`<div style="text-align:center;padding:14px;font-size:12px;color:var(--text-muted)">No results found — try a different title or author, or fill the form in by hand.</div>`;return;}
+    window._searchResults=books;
+    res.innerHTML=books.map((b,i)=>`<div onclick="selectSearchResult(${i})" style="display:flex;gap:10px;align-items:center;padding:10px 11px;border-radius:10px;cursor:pointer;border:1px solid var(--card-border);margin-bottom:6px;background:var(--plum)">
+        ${b.cover?`<img src="${esc(b.cover)}" style="width:34px;height:48px;border-radius:4px;object-fit:cover;flex-shrink:0" onerror="this.style.display='none'">`:`<div style="width:34px;height:48px;border-radius:4px;background:var(--plum-light);display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0">📕</div>`}
         <div style="flex:1;min-width:0">
-          <div style="font-family:'Playfair Display',serif;font-size:13px;color:var(--champagne);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(doc.title||'')}</div>
-          ${author?`<div style="font-size:11px;color:var(--text-secondary);margin-top:1px">${esc(author)}</div>`:''}
-          <div style="font-size:10px;color:var(--text-muted);margin-top:1px">${doc.first_publish_year||''} ${doc.number_of_pages_median?'· '+doc.number_of_pages_median+' pages':''}</div>
+          <div style="font-family:'Playfair Display',serif;font-size:13px;color:var(--champagne);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(b.title)}</div>
+          ${b.author?`<div style="font-size:11px;color:var(--text-secondary);margin-top:1px">${esc(b.author)}</div>`:''}
+          <div style="font-size:10px;color:var(--text-muted);margin-top:1px">${[b.year,b.pages?b.pages+' pages':''].filter(Boolean).map(x=>esc(String(x))).join(' · ')}</div>
         </div>
         <div style="font-size:11px;color:var(--rose);flex-shrink:0">Select →</div>
-      </div>`;
-    }).join('');
-    // Store results for selection
-    window._searchResults=data.docs;
+      </div>`).join('');
   }catch(e){res.innerHTML=`<div style="text-align:center;padding:14px;font-size:12px;color:#e05070">Search failed — check your connection</div>`;}
 }
 function selectSearchResult(i){
-  const doc=window._searchResults&&window._searchResults[i];
-  if(!doc)return;
-  const isbn=(doc.isbn||[])[0]||'';
-  // If we have an ISBN, do a full lookup for richer data; otherwise apply what we have
+  const b=window._searchResults&&window._searchResults[i];
+  if(!b)return;
   document.getElementById('search-inline').classList.add('hidden');
   document.getElementById('search-results').innerHTML='';
-  if(isbn){
-    fetchISBN(isbn,false);
-  } else {
-    applyBookData({
-      title:doc.title||'',
-      author:(doc.author_name||[]).join(', '),
-      pages:doc.number_of_pages_median||0,
-      isbn:'',
-      genre:(doc.subject||[]).slice(0,3).join(', '),
-      cover:doc.cover_i?`https://covers.openlibrary.org/b/id/${doc.cover_i}-M.jpg`:'',
-    },false);
-    showBanner('✅ Book details loaded!');
-  }
+  applyBookData({title:b.title,author:b.author,pages:b.pages,isbn:b.isbn,genre:b.genre,cover:b.cover},false);
+  showBanner('✅ Book details loaded — double-check the edition');
 }
 function showBanner(msg,type='info'){
   const b=document.getElementById('lookup-banner');
@@ -1342,14 +1590,16 @@ function showBanner(msg,type='info'){
   b.style.background=type==='error'?'rgba(224,80,112,.15)':'rgba(196,120,138,.15)';
   b.style.borderColor=type==='error'?'rgba(224,80,112,.3)':'rgba(196,120,138,.3)';
   b.style.color=type==='error'?'#e05070':'var(--rose-light)';
-  if(type!=='loading')setTimeout(()=>b.classList.remove('show'),3000);
+  if(type!=='loading')setTimeout(()=>b.classList.remove('show'),type==='error'?8000:3000);
 }
 
 async function fetchISBN(isbn,scanned){
   showBanner(`🔍 Searching for ISBN ${isbn}…`,'loading');
   const result=await lookupISBN(isbn);
   if(!result){
-    showBanner(`❌ ISBN ${isbn} not found in Google Books or Open Library. You can fill in details manually or try the Search tab.`,'error');
+    document.getElementById('b-isbn').value=isbn;
+    const why=lookupNotes.length?` (${[...new Set(lookupNotes)].join('; ')})`:'';
+    showBanner(`❌ ISBN ${isbn} wasn't found${why}. The ISBN is saved in the form — type the title and author, or try 🔍 Search or 🖼️ Cover.`,'error');
     return;
   }
   if(result.editions&&result.editions.length>1){
@@ -1363,79 +1613,53 @@ async function fetchISBN(isbn,scanned){
 }
 
 async function fetchISBNSilent(isbn,shelfId){
-  // Used during shelf scanning — creates book automatically
+  // Used during shelf scanning — creates the book automatically (or a placeholder if no database knows it)
+  const addToShelf=b=>{
+    if(!b.shelfIds)b.shelfIds=[];
+    if(b.shelfIds.includes(shelfId)){showToast(`"${b.title}" is already on this shelf`);return null;}
+    b.shelfIds.push(shelfId);save();return b;
+  };
+  const dup=S.books.find(b=>b.isbn===isbn);
+  if(dup)return addToShelf(dup);
   const result=await lookupISBN(isbn);
   const data=result?(result.editions?result.editions[0]:result):null;
-  if(!data){
-    showToast(`⚠️ ISBN ${isbn} not found — add manually`);
-    return null;
-  }
-  // Check for existing book by ISBN
-  const existing=S.books.find(b=>b.isbn===isbn||(b.isbn&&b.isbn===data.isbn));
-  if(existing){
-    // Add to shelf if not already
-    if(!existing.shelfIds)existing.shelfIds=[];
-    if(!existing.shelfIds.includes(shelfId)){
-      existing.shelfIds.push(shelfId);
-      save();return existing;
-    } else {
-      showToast(`"${existing.title}" already on this shelf`);return null;
-    }
-  }
+  if(data){const dup2=S.books.find(b=>b.isbn&&b.isbn===data.isbn);if(dup2)return addToShelf(dup2);}
+  const found=!!data;
   const book={
     id:Date.now().toString()+Math.random().toString(36).slice(2),
-    title:data.title||'Unknown Title',author:data.author||'Unknown Author',
-    genre:data.genre||'',pages:data.pages||0,isbn:data.isbn||isbn,
-    cover:data.cover||'',status:'tbr',progress:0,rating:0,review:'',
+    title:found?(data.title||'Unknown Title'):`Unidentified book (${isbn})`,
+    author:found?(data.author||'Unknown Author'):'',
+    genre:found?(data.genre||''):'',pages:found?(data.pages||0):0,isbn:found?(data.isbn||isbn):isbn,
+    cover:found?(data.cover||''):'',status:'tbr',progress:0,rating:0,review:'',
     favourite:false,dateStart:'',dateEnd:'',
     added:new Date().toISOString(),scanned:true,tags:[],
-    shelfIds:[shelfId],
+    shelfIds:[shelfId],needsInfo:!found,
   };
   S.books.unshift(book);save();renderBooks();
+  if(!found)showToast('Not in the databases — saved as a placeholder. Open it later to add details.');
   return book;
 }
 
 // ---- Source 1: Google Books (best coverage, especially recent titles) ----
 async function lookupGoogleBooks(isbn){
-  try{
-    const r=await fetch(`https://www.googleapis.com/books/v1/volumes?q=isbn:${isbn}&maxResults=3`);
-    const data=await r.json();
-    if(!data.items||!data.items.length)return null;
-    if(data.items.length>1){
-      // Multiple editions — return them all for the picker
-      const editions=data.items.map(item=>{
-        const v=item.volumeInfo||{};
-        return {
-          title:v.title||'',
-          author:(v.authors||[]).join(', '),
-          pages:v.pageCount||0,
-          isbn:(v.industryIdentifiers||[]).find(x=>x.type==='ISBN_13')?.identifier||
-               (v.industryIdentifiers||[]).find(x=>x.type==='ISBN_10')?.identifier||isbn,
-          cover:v.imageLinks?v.imageLinks.thumbnail||v.imageLinks.smallThumbnail||'':'',
-          publisher:v.publisher||'',
-          year:v.publishedDate?v.publishedDate.slice(0,4):'',
-          genre:(v.categories||[]).slice(0,3).join(', '),
-          description:v.description||'',
-        };
-      });
-      return {editions};
+  const alt=altISBN(isbn);
+  const tries=[`isbn:${isbn}`,...(alt?[`isbn:${alt}`]:[]),isbn];
+  for(const q of tries){
+    const r=await gbFetch(q,5);
+    if(r.error){
+      lookupNotes.push(r.error==='busy'?'Google Books is rate-limiting right now':'Google Books could not be reached');
+      return null;
     }
-    const v=data.items[0].volumeInfo||{};
-    return {
-      title:v.title||'',
-      author:(v.authors||[]).join(', '),
-      pages:v.pageCount||0,
-      isbn:(v.industryIdentifiers||[]).find(x=>x.type==='ISBN_13')?.identifier||
-           (v.industryIdentifiers||[]).find(x=>x.type==='ISBN_10')?.identifier||isbn,
-      cover:v.imageLinks?
-        // Use larger image and remove curl effect Googles adds
-        (v.imageLinks.thumbnail||v.imageLinks.smallThumbnail||'').replace('&edge=curl',''):'',
-      publisher:v.publisher||'',
-      year:v.publishedDate?v.publishedDate.slice(0,4):'',
-      genre:(v.categories||[]).slice(0,3).join(', '),
-      description:v.description||'',
-    };
-  }catch(e){return null;}
+    let items=r.items;
+    if(q===isbn){ // plain keyword search: keep only volumes that really carry this ISBN
+      items=items.filter(it=>((it.volumeInfo||{}).industryIdentifiers||[]).some(x=>x.identifier===isbn||x.identifier===alt));
+    }
+    if(items.length){
+      const books=items.map(it=>{const b=gbItemToBook(it);b.isbn=b.isbn||isbn;return b;});
+      return books.length>1?{editions:books}:books[0];
+    }
+  }
+  return null;
 }
 
 // ---- Source 2: Open Library (good for older/classic books) ----
@@ -1456,6 +1680,27 @@ async function lookupOpenLibrary(isbn){
         year:bk.publish_date||'',
       };
     }
+    // Direct edition record: finds books the other endpoints miss
+    try{
+      const re=await fetch(`https://openlibrary.org/isbn/${isbn}.json`);
+      if(re.ok){
+        const ed=await re.json();
+        if(ed&&ed.title){
+          let author='';
+          try{
+            const keys=(ed.authors||[]).slice(0,3).map(a=>a.key).filter(Boolean);
+            const names=await Promise.all(keys.map(k=>fetch(`https://openlibrary.org${k}.json`).then(x=>x.json()).then(j=>j.name||'').catch(()=>'')));
+            author=names.filter(Boolean).join(', ');
+          }catch(e){}
+          return {
+            title:ed.title,author,pages:ed.number_of_pages||0,isbn,
+            genre:(ed.subjects||[]).slice(0,3).join(', '),
+            cover:(ed.covers&&ed.covers[0]>0)?`https://covers.openlibrary.org/b/id/${ed.covers[0]}-M.jpg`:'',
+            publisher:(ed.publishers||[]).join(', '),year:ed.publish_date||''
+          };
+        }
+      }
+    }catch(e){}
     // OL search fallback
     const r2=await fetch(`https://openlibrary.org/search.json?isbn=${isbn}&limit=1`);
     const d2=await r2.json();
@@ -1489,16 +1734,18 @@ async function lookupOpenLibrary(isbn){
   }catch(e){return null;}
 }
 
-// ---- Main lookup: try Google Books first, then Open Library ----
+// ---- Main lookup: Google Books (several query styles) -> Open Library -> Open Library with the alternate ISBN form ----
 async function lookupISBN(isbn){
-  // Show which ISBN was scanned so user can verify/debug
-  console.log('Looking up ISBN:', isbn);
-  const result=await lookupGoogleBooks(isbn);
-  if(result){console.log('Found via Google Books');return result;}
-  console.log('Google Books miss, trying Open Library...');
-  const result2=await lookupOpenLibrary(isbn);
-  if(result2){console.log('Found via Open Library');return result2;}
-  console.log('Both sources returned nothing for ISBN:',isbn);
+  lookupNotes=[];
+  const g=await lookupGoogleBooks(isbn);
+  if(g)return g;
+  const o=await lookupOpenLibrary(isbn);
+  if(o)return o;
+  const alt=altISBN(isbn);
+  if(alt){
+    const o2=await lookupOpenLibrary(alt);
+    if(o2){o2.isbn=isbn;return o2;}
+  }
   return null;
 }
 
@@ -1615,6 +1862,7 @@ function saveBook(){
     dateEnd:document.getElementById('b-date-end').value,
     added:editBookId?(ex.added||new Date().toISOString()):new Date().toISOString(),
     scanned:ex.scanned||nextBookScanned,
+    needsInfo:/^Unidentified book \(/.test(title),
     tags:[...editTags],
     shelfIds,
   };
@@ -1656,7 +1904,7 @@ function renderBooks(){
       <div class="book-info">
         <div class="book-title">${esc(b.title)}${b.favourite?' ❤️':''}</div>
         <div class="book-author">${esc(b.author)}</div>
-        <div class="book-meta"><span class="badge ${sc[b.status]}">${sl[b.status]}</span>${stars?`<span class="stars">${stars}</span>`:''}</div>
+        <div class="book-meta"><span class="badge ${sc[b.status]}">${sl[b.status]}</span>${stars?`<span class="stars">${stars}</span>`:''}${b.needsInfo?'<span class="badge badge-tbr">📝 Needs details</span>':''}</div>
         ${tagHtml?`<div style="margin-top:5px">${tagHtml}</div>`:''}
         ${b.status==='reading'&&b.pages?`<div class="prog-wrap"><div class="prog-fill" style="width:${pct}%"></div></div><div style="font-size:10px;color:var(--text-muted);margin-top:3px">${b.progress||0}/${b.pages} pages · ${pct}%</div>`:''}
       </div>
@@ -1830,7 +2078,7 @@ function renderShelfDetailBooks(){
       <div class="book-info">
         <div class="book-title">${esc(b.title)}${b.favourite?' ❤️':''}</div>
         <div class="book-author">${esc(b.author)}</div>
-        <div class="book-meta"><span class="badge ${sc[b.status]}">${sl[b.status]}</span></div>
+        <div class="book-meta"><span class="badge ${sc[b.status]}">${sl[b.status]}</span>${b.needsInfo?'<span class="badge badge-tbr">📝 Needs details</span>':''}</div>
       </div>
       <button class="btn btn-sm" style="background:transparent;color:var(--text-muted);border:1px solid var(--card-border);align-self:center;flex-shrink:0" onclick="event.stopPropagation();removeFromShelf('${b.id}','${id}')">✕</button>
     </div>`;
