@@ -1394,24 +1394,30 @@ function gbItemToBook(item){
   };
 }
 // Optional Google Books API key (restrict it to this site's address in Google Cloud). Empty = keyless.
-const GB_KEY='';
+const GB_KEY='AIzaSyAqpKh70LJQvJSPutuvFtNA7d1e7C1KCNk';
 let lookupNotes=[];
 // Google Books fetch that tells "busy / rate-limited" apart from "no results"
+let gbKeyBad=false;
 async function gbFetch(q,max){
-  const url=`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&maxResults=${max||5}&printType=books${GB_KEY?'&key='+GB_KEY:''}`;
-  for(let attempt=0;attempt<2;attempt++){
+  const mk=useKey=>`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&maxResults=${max||5}&printType=books${useKey?'&key='+GB_KEY:''}`;
+  let retried=false;
+  for(let attempt=0;attempt<3;attempt++){
     try{
-      const r=await fetch(url);
+      const useKey=!!GB_KEY&&!gbKeyBad;
+      const r=await fetch(mk(useKey));
       let d=null;try{d=await r.json();}catch(e){}
-      const busy=r.status===429||(d&&d.error&&(d.error.code===429||/quota|rate/i.test(JSON.stringify(d.error))));
+      const busy=r.status===429||(d&&d.error&&(d.error.code===429||/quota|rate.?limit/i.test(JSON.stringify(d.error))));
       if(busy){
-        if(attempt===0){await new Promise(res=>setTimeout(res,1200));continue;}
+        if(!retried){retried=true;await new Promise(res=>setTimeout(res,1200));continue;}
         return {items:[],error:'busy'};
+      }
+      if(useKey&&(r.status===400||r.status===403)){ // key not accepted (restriction/API not ready yet): carry on keyless
+        gbKeyBad=true;console.warn('Google Books key was rejected; continuing without it');continue;
       }
       if(!r.ok)return {items:[],error:'http'};
       return {items:(d&&d.items)||[]};
     }catch(e){
-      if(attempt===1)return {items:[],error:'network'};
+      if(attempt>=1)return {items:[],error:'network'};
     }
   }
   return {items:[],error:'network'};
