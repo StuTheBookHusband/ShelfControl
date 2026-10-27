@@ -586,7 +586,8 @@ body{font-family:'Lato',sans-serif;background:var(--plum);color:var(--text-prima
       <button class="btn btn-primary" style="flex:1;font-size:13px" onclick="coverSearchText()">🔍 Search</button>
     </div>
     <div id="cover-results"></div>
-    <button class="btn btn-secondary btn-full" style="margin-top:4px" onclick="closeModal('modal-cover')">Cancel</button>
+    <button class="btn btn-secondary btn-full" style="margin-top:4px" onclick="coverManual()">✏️ Not here — add it myself</button>
+    <button class="btn btn-secondary btn-full" style="margin-top:8px" onclick="closeModal('modal-cover')">Cancel</button>
   </div>
 </div>
 
@@ -1305,7 +1306,7 @@ async function handleCoverPhoto(e){
   const file=e.target.files&&e.target.files[0];
   e.target.value='';
   if(!file)return;
-  coverResults=[];
+  coverResults=[];coverAuthors=[];coverThumb='';
   document.getElementById('cover-results').innerHTML='';
   document.getElementById('modal-cover').classList.add('open');
   await runCoverOCR(file);
@@ -1388,6 +1389,11 @@ async function prepCoverCanvases(file){
     const c=document.createElement('canvas');c.width=w;c.height=h;
     const x=c.getContext('2d',{willReadFrequently:true});x.drawImage(img,0,0,w,h);
     const px=x.getImageData(0,0,w,h).data;
+    try{ // small copy of the user's own photo, usable as the book's cover
+      const tw=240,th=Math.round(img.naturalHeight*(tw/img.naturalWidth));
+      const tc=document.createElement('canvas');tc.width=tw;tc.height=th;tc.getContext('2d').drawImage(img,0,0,tw,th);
+      coverThumb=tc.toDataURL('image/jpeg',0.72);
+    }catch(e){coverThumb='';}
     return makeOcrVariants(px,w,h).map(v=>({label:v.label,canvas:grayToCanvas(v.gray,w,h),h}));
   }finally{URL.revokeObjectURL(url);}
 }
@@ -1422,11 +1428,10 @@ function ocrLines(data){
   const clean=s=>String(s||'').replace(/[^\p{L}\p{N}'&\- ]+/gu,' ').replace(/\s+/g,' ').trim();
   return (lines||[]).map(l=>{
     const text=clean(l.text),conf=l.confidence||0;
-    const words=Array.isArray(l.words)&&l.words.length?l.words.map(w=>({t:clean(w.text),c:w.confidence||0,h:w.bbox?(w.bbox.y1-w.bbox.y0):0})):text.split(' ').map(t=>({t,c:conf,h:0}));
-    const mh=Math.max(0,...words.map(w=>w.h));
+    const raw=Array.isArray(l.words)&&l.words.length?l.words.map(w=>({t:clean(w.text),c:w.confidence||0,h:w.bbox?(w.bbox.y1-w.bbox.y0):0})):text.split(' ').map(t=>({t,c:conf,h:0}));
     return {
       text,conf,
-      good:words.filter(w=>w.c>=75&&/\p{L}{3}/u.test(w.t)&&(!mh||w.h>=0.55*mh)).map(w=>w.t).join(' '),   // confident, title-sized words only
+      words:raw.filter(w=>w.c>=75&&/\p{L}{3}/u.test(w.t)),     // confidently-read words, with their sizes
       h:l.bbox?(l.bbox.y1-l.bbox.y0):0,
       y1:l.bbox?l.bbox.y1:0
     };
@@ -1436,10 +1441,17 @@ function ocrLines(data){
     return letters/Math.max(1,l.text.replace(/\s/g,'').length)>=0.6;
   });
 }
+// Same line seen in several passes -> keep the best one. Word sizes use the smallest value seen
+// (one pass can inflate a word's box; the others usually agree on the true size).
 function dedupeLines(lines){
+  const wmin=new Map();
+  lines.forEach(l=>(l.words||[]).forEach(w=>{
+    const k=w.t.toLowerCase();
+    if(w.h>0){const cur=wmin.get(k);if(!cur||w.h<cur)wmin.set(k,w.h);}
+  }));
   const best=new Map();
   for(const l of lines){const k=l.text.toLowerCase(),cur=best.get(k);if(!cur||l.conf>cur.conf)best.set(k,l);}
-  return [...best.values()];
+  return [...best.values()].map(l=>({...l,words:(l.words||[]).map(w=>({...w,h:wmin.get(w.t.toLowerCase())||w.h}))}));
 }
 const OCR_STOP=new Set([...COVER_STOPWORDS,'usa','today','authors','award','winning','international','amazon','national','edition','collection','special']);
 // Author names are the most reliable text on a cover: 2-3 clean words, usually near the bottom
@@ -1451,21 +1463,35 @@ function pickAuthors(lines,H){
   const score=l=>l.conf+(H?(l.y1/H)*40:0);
   return cands.sort((a,b)=>score(b)-score(a)).slice(0,2).map(l=>l.text);
 }
+// Keep only title-sized words (drops taglines / blurbs / small print), judged against the biggest confident word
+function applyTitleSize(lines){
+  let ref=0;
+  lines.forEach(l=>(l.words||[]).forEach(w=>{if(w.c>=80&&w.h>ref)ref=w.h;}));
+  lines.forEach(l=>{
+    const keep=(l.words||[]).filter(w=>!ref||!w.h||w.h>=0.35*ref);
+    l.good=keep.map(w=>w.t).join(' ');
+    l.gh=Math.max(0,...keep.map(w=>w.h));
+  });
+  return lines;
+}
 function ocrTokens(lines){
   const m=new Map();
   lines.forEach(l=>{
+    if(!l.good)return;
     const w=l.conf/100;
-    String(l.text).toLowerCase().split(/[^\p{L}\p{N}]+/u).forEach(t=>{
+    l.good.toLowerCase().split(/[^\p{L}\p{N}]+/u).forEach(t=>{
       if(t.length>=3&&!OCR_STOP.has(t)&&w>(m.get(t)||0))m.set(t,w);
     });
   });
   return [...m.entries()].map(([t,w])=>({t,w}));
 }
 function coverPlan(lines,H){
+  applyTitleSize(lines);
   const authors=pickAuthors(lines,H);
   const authorKeys=new Set(authors.map(a=>a.toLowerCase()));
   const rest=lines.filter(l=>l.good&&!authorKeys.has(l.text.toLowerCase())&&l.good.split(' ').some(w=>!OCR_STOP.has(w.toLowerCase())));
-  const ranked=[...rest].sort((a,b)=>(b.h*b.conf*b.conf)-(a.h*a.conf*a.conf));
+  const size=l=>(l.gh||l.h)*l.conf*l.conf;
+  const ranked=[...rest].sort((a,b)=>size(b)-size(a));
   const top=n=>ranked.slice(0,n).map(l=>l.good).join(' ');
   const plain=[...new Set([top(2),top(1),top(3)].map(q=>q.trim()).filter(q=>q.length>=4))];
   const textBox=[authors[0]||'',...ranked.slice(0,2).map(l=>l.good)].filter(Boolean).join(' ').slice(0,90);
@@ -1522,8 +1548,8 @@ const GB_KEY='AIzaSyAqpKh70LJQvJSPutuvFtNA7d1e7C1KCNk';
 let lookupNotes=[];
 // Google Books fetch that tells "busy / rate-limited" apart from "no results"
 let gbKeyBad=false;
-async function gbFetch(q,max){
-  const mk=useKey=>`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&maxResults=${max||5}&printType=books${useKey?'&key='+GB_KEY:''}`;
+async function gbFetch(q,max,start){
+  const mk=useKey=>`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&maxResults=${max||5}${start?'&startIndex='+start:''}&printType=books${useKey?'&key='+GB_KEY:''}`;
   let retried=false;
   for(let attempt=0;attempt<3;attempt++){
     try{
@@ -1563,7 +1589,7 @@ async function gbSearch(q,max){
 }
 async function olSearch(q,mode){
   const param=mode==='author'?'author':'q';
-  const r=await fetch(`https://openlibrary.org/search.json?${param}=${encodeURIComponent(q)}&limit=${mode==='author'?25:10}&fields=title,author_name,isbn,cover_i,number_of_pages_median,first_publish_year,publisher,subject`);
+  const r=await fetch(`https://openlibrary.org/search.json?${param}=${encodeURIComponent(q)}&limit=${mode==='author'?100:10}&fields=title,author_name,isbn,cover_i,number_of_pages_median,first_publish_year,publisher,subject`);
   const d=await r.json();
   return (d.docs||[]).map(doc=>({
     title:doc.title||'',subtitle:'',
@@ -1591,8 +1617,18 @@ function mergeBooks(list){
   }
   return [...map.values()];
 }
+async function gbSearchPaged(q,pages){
+  const out=[];
+  for(let p=0;p<pages;p++){
+    const r=await gbFetch(q,40,p*40);
+    const items=r.items||[];
+    out.push(...items.map(gbItemToBook).filter(b=>b.title));
+    if(r.error||items.length<40)break;      // last page reached
+  }
+  return out;
+}
 async function searchByAuthor(name){
-  const [g,o]=await Promise.all([gbSearch(`inauthor:"${name}"`,20).catch(()=>[]),olSearch(name,'author').catch(()=>[])]);
+  const [g,o]=await Promise.all([gbSearchPaged(`inauthor:"${name}"`,3).catch(()=>[]),olSearch(name,'author').catch(()=>[])]);
   return mergeBooks([...g,...o]);
 }
 async function searchAllSources(q){
@@ -1609,8 +1645,10 @@ async function searchCover(queries,tokens,authors){
     const all=mergeBooks(lists.flat());
     all.forEach(b=>{b._score=scoreBook(b,tokens,authors);b._tscore=scoreBook(b,tokens,[],true);});
     coverAuthors=authors;
-    all.sort((x,y)=>y._score-x._score);
-    coverResults=all.slice(0,8);
+    const yr=b=>parseInt(b.year)||0;
+    all.sort((x,y)=>(y._score-x._score)||(yr(y)-yr(x)));   // ties: newest first
+    const strong=all.length&&all[0]._tscore>=0.7;
+    coverResults=all.slice(0,strong?8:15);
     renderCoverResults();
   }catch(e){coverStatus('Search failed — check your connection','error');}
 }
@@ -1619,7 +1657,7 @@ function renderCoverResults(){
   if(!coverResults.length){el.innerHTML='';coverStatus('No matches found. Edit the text above and tap Search.','error');return;}
   const top=coverResults[0];
   if(top._tscore>=0.7)coverStatus('Is this your book? Tap to select.');
-  else if(coverAuthors.length)coverStatus(`Found books by ${coverAuthors[0]}, but I couldn't match the title. Pick yours, or edit the text above.`);
+  else if(coverAuthors.length)coverStatus(`Found books by ${coverAuthors[0]}, but I couldn't match the title. Pick yours, edit the text above, or tap "Not here" at the bottom.`);
   else coverStatus('Not sure — compare the covers and pick the closest, or edit the text above.');
   el.innerHTML=coverResults.map((b,i)=>`<div class="edition-card" onclick="pickCoverResult(${i})">
     ${b.cover?`<img src="${esc(b.cover)}" class="edition-cover" onerror="this.style.display='none'">`:`<div class="edition-cover-ph">📕</div>`}
@@ -1632,7 +1670,17 @@ function pickCoverResult(i){
   const b=coverResults[i];if(!b)return;
   closeModal('modal-cover');
   applyBookData({title:b.title,author:b.author,pages:b.pages,isbn:b.isbn,genre:b.genre,cover:b.cover},false);
+  if(!b.cover&&coverThumb)pendingUserCover=coverThumb;      // no cover online: use your own photo
   showBanner('✅ Book details loaded — double-check the edition');
+}
+function coverManual(){
+  closeModal('modal-cover');
+  const a=(coverAuthors[0]||'').toLowerCase().split(' ').filter(Boolean).map(w=>w.charAt(0).toUpperCase()+w.slice(1)).join(' ');
+  const au=document.getElementById('b-author');
+  if(a&&!au.value.trim())au.value=a;
+  if(coverThumb)pendingUserCover=coverThumb;
+  showBanner(`✏️ Type the title${a?' — the author is filled in':''}. Your photo will be used as the cover.`);
+  document.getElementById('b-title').focus();
 }
 async function coverSearchText(){
   const q=document.getElementById('cover-text').value.trim();
@@ -1895,6 +1943,7 @@ async function lookupISBN(isbn){
 
 let pendingEditions=[];
 let nextBookScanned=false;
+let pendingUserCover='',coverThumb='';
 function showEditionPicker(editions,scanned){
   pendingEditions=editions;
   document.getElementById('editions-list').innerHTML=editions.map((e,i)=>`
@@ -1935,7 +1984,7 @@ function applyBookData(data,scanned){
 // BOOKS
 // ================================================================
 function openAddBook(preShelfId){
-  editBookId=null;bookRating=0;editTags=[];nextBookScanned=false;
+  editBookId=null;bookRating=0;editTags=[];nextBookScanned=false;pendingUserCover='';
   document.getElementById('book-modal-title').textContent='Add a Book 📖';
   ['b-title','b-author','b-genre','b-isbn','b-cover','b-review'].forEach(id=>document.getElementById(id).value='');
   document.getElementById('b-pages').value='';document.getElementById('b-progress').value='';
@@ -1958,7 +2007,9 @@ function openEditBook(id){
   document.getElementById('b-genre').value=b.genre||'';
   document.getElementById('b-pages').value=b.pages||'';
   document.getElementById('b-isbn').value=b.isbn||'';
-  document.getElementById('b-cover').value=b.cover||'';
+  pendingUserCover='';
+  if((b.cover||'').startsWith('data:')){pendingUserCover=b.cover;document.getElementById('b-cover').value='';}
+  else document.getElementById('b-cover').value=b.cover||'';
   document.getElementById('b-status').value=b.status;
   document.getElementById('b-progress').value=b.progress||'';
   document.getElementById('b-review').value=b.review||'';
@@ -1996,7 +2047,7 @@ function saveBook(){
     genre:document.getElementById('b-genre').value.trim(),
     pages:parseInt(document.getElementById('b-pages').value)||0,
     isbn:document.getElementById('b-isbn').value.trim(),
-    cover:document.getElementById('b-cover').value.trim(),
+    cover:document.getElementById('b-cover').value.trim()||pendingUserCover,
     status:document.getElementById('b-status').value,
     progress:parseInt(document.getElementById('b-progress').value)||0,
     rating:bookRating,
